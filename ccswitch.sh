@@ -8,6 +8,7 @@ set -euo pipefail
 # Configuration
 readonly BACKUP_DIR="$HOME/.claude-switch-backup"
 readonly SEQUENCE_FILE="$BACKUP_DIR/sequence.json"
+readonly ALIAS_DIR="${CCSWITCH_ALIAS_DIR:-$HOME/.claude-switch-backup/aliases}"
 
 # Container detection
 is_running_in_container() {
@@ -87,21 +88,53 @@ validate_email() {
     fi
 }
 
-# Account identifier resolution function
+# Account identifier resolution function (supports number, email, or alias)
 resolve_account_identifier() {
     local identifier="$1"
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
         echo "$identifier"  # It's a number
     else
-        # Look up account number by email
+        # Try email first
         local account_num
         account_num=$(jq -r --arg email "$identifier" '.accounts | to_entries[] | select(.value.email == $email) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+        if [[ -n "$account_num" && "$account_num" != "null" ]]; then
+            echo "$account_num"
+            return
+        fi
+        # Try alias
+        account_num=$(jq -r --arg alias "$identifier" '.accounts | to_entries[] | select(.value.alias == $alias) | .key' "$SEQUENCE_FILE" 2>/dev/null)
         if [[ -n "$account_num" && "$account_num" != "null" ]]; then
             echo "$account_num"
         else
             echo ""
         fi
     fi
+}
+
+# Alias validation (alphanumeric, dash, underscore only)
+validate_alias() {
+    local alias_name="$1"
+    if [[ "$alias_name" =~ ^[a-zA-Z][a-zA-Z0-9_-]*$ ]]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Check if alias already exists for another account
+alias_exists() {
+    local alias_name="$1"
+    local exclude_account="${2:-}"
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        return 1
+    fi
+    local found
+    if [[ -n "$exclude_account" ]]; then
+        found=$(jq -r --arg alias "$alias_name" --arg exclude "$exclude_account" '.accounts | to_entries[] | select(.value.alias == $alias and .key != $exclude) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+    else
+        found=$(jq -r --arg alias "$alias_name" '.accounts | to_entries[] | select(.value.alias == $alias) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+    fi
+    [[ -n "$found" && "$found" != "null" ]]
 }
 
 # Safe JSON write with validation
@@ -146,8 +179,10 @@ check_dependencies() {
 # Setup backup directories
 setup_directories() {
     mkdir -p "$BACKUP_DIR"/{configs,credentials}
+    mkdir -p "$ALIAS_DIR"
     chmod 700 "$BACKUP_DIR"
     chmod 700 "$BACKUP_DIR"/{configs,credentials}
+    chmod 755 "$ALIAS_DIR"
 }
 
 # Claude Code process detection (Node.js app)
@@ -311,6 +346,191 @@ init_sequence_file() {
     fi
 }
 
+# Set alias for an account
+cmd_set_alias() {
+    if [[ $# -lt 2 ]]; then
+        echo "Usage: $0 --set-alias <account_number|email> <alias_name>"
+        exit 1
+    fi
+    
+    local identifier="$1"
+    local alias_name="$2"
+    
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        echo "Error: No accounts are managed yet"
+        exit 1
+    fi
+    
+    # Validate alias format
+    if ! validate_alias "$alias_name"; then
+        echo "Error: Invalid alias format. Use alphanumeric, dash, underscore. Must start with letter."
+        exit 1
+    fi
+    
+    # Resolve account
+    local account_num
+    account_num=$(resolve_account_identifier "$identifier")
+    if [[ -z "$account_num" ]]; then
+        echo "Error: Account not found: $identifier"
+        exit 1
+    fi
+    
+    # Check account exists
+    local account_info
+    account_info=$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")
+    if [[ -z "$account_info" ]]; then
+        echo "Error: Account-$account_num does not exist"
+        exit 1
+    fi
+    
+    # Check alias not taken by another account
+    if alias_exists "$alias_name" "$account_num"; then
+        echo "Error: Alias '$alias_name' is already used by another account"
+        exit 1
+    fi
+    
+    local email
+    email=$(echo "$account_info" | jq -r '.email')
+    
+    # Update sequence.json with alias
+    local updated_sequence
+    updated_sequence=$(jq --arg num "$account_num" --arg alias "$alias_name" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .accounts[$num].alias = $alias |
+        .lastUpdated = $now
+    ' "$SEQUENCE_FILE")
+    
+    write_json "$SEQUENCE_FILE" "$updated_sequence"
+    
+    echo "Set alias '$alias_name' for Account-$account_num ($email)"
+}
+
+# Clear alias for an account
+cmd_clear_alias() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: $0 --clear-alias <account_number|email|alias>"
+        exit 1
+    fi
+    
+    local identifier="$1"
+    
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        echo "Error: No accounts are managed yet"
+        exit 1
+    fi
+    
+    # Resolve account
+    local account_num
+    account_num=$(resolve_account_identifier "$identifier")
+    if [[ -z "$account_num" ]]; then
+        echo "Error: Account not found: $identifier"
+        exit 1
+    fi
+    
+    local account_info
+    account_info=$(jq -r --arg num "$account_num" '.accounts[$num] // empty' "$SEQUENCE_FILE")
+    if [[ -z "$account_info" ]]; then
+        echo "Error: Account-$account_num does not exist"
+        exit 1
+    fi
+    
+    local email current_alias
+    email=$(echo "$account_info" | jq -r '.email')
+    current_alias=$(echo "$account_info" | jq -r '.alias // empty')
+    
+    if [[ -z "$current_alias" ]]; then
+        echo "Account-$account_num ($email) has no alias set"
+        exit 0
+    fi
+    
+    # Remove alias shortcut if exists
+    local shortcut_file="$ALIAS_DIR/$current_alias"
+    if [[ -f "$shortcut_file" ]]; then
+        rm -f "$shortcut_file"
+    fi
+    
+    # Update sequence.json
+    local updated_sequence
+    updated_sequence=$(jq --arg num "$account_num" --arg now "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        .accounts[$num] |= del(.alias) |
+        .lastUpdated = $now
+    ' "$SEQUENCE_FILE")
+    
+    write_json "$SEQUENCE_FILE" "$updated_sequence"
+    
+    echo "Cleared alias '$current_alias' from Account-$account_num ($email)"
+}
+
+# Create shortcut command for an alias
+cmd_create_shortcut() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: $0 --create-shortcut <alias_name>"
+        exit 1
+    fi
+    
+    local alias_name="$1"
+    
+    if [[ ! -f "$SEQUENCE_FILE" ]]; then
+        echo "Error: No accounts are managed yet"
+        exit 1
+    fi
+    
+    # Find account with this alias
+    local account_num
+    account_num=$(jq -r --arg alias "$alias_name" '.accounts | to_entries[] | select(.value.alias == $alias) | .key' "$SEQUENCE_FILE" 2>/dev/null)
+    
+    if [[ -z "$account_num" || "$account_num" == "null" ]]; then
+        echo "Error: No account found with alias '$alias_name'"
+        exit 1
+    fi
+    
+    setup_directories
+    
+    # Get the script's absolute path
+    local script_path
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    
+    local shortcut_file="$ALIAS_DIR/$alias_name"
+    
+    # Create shortcut script
+    cat > "$shortcut_file" << EOF
+#!/usr/bin/env bash
+# Shortcut to switch to Claude Code account: $alias_name
+exec "$script_path" --force --switch-to "$alias_name"
+EOF
+    
+    chmod +x "$shortcut_file"
+    
+    local email
+    email=$(jq -r --arg num "$account_num" '.accounts[$num].email' "$SEQUENCE_FILE")
+    
+    echo "Created shortcut: $shortcut_file"
+    echo "  Switches to: Account-$account_num ($email)"
+    echo ""
+    echo "To use from anywhere, add to PATH:"
+    echo "  export PATH=\"\$PATH:$ALIAS_DIR\""
+    echo ""
+    echo "Then run: $alias_name"
+}
+
+# Remove shortcut command
+cmd_remove_shortcut() {
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: $0 --remove-shortcut <alias_name>"
+        exit 1
+    fi
+    
+    local alias_name="$1"
+    local shortcut_file="$ALIAS_DIR/$alias_name"
+    
+    if [[ ! -f "$shortcut_file" ]]; then
+        echo "Error: Shortcut '$alias_name' does not exist"
+        exit 1
+    fi
+    
+    rm -f "$shortcut_file"
+    echo "Removed shortcut: $alias_name"
+}
+
 # Get next account number
 get_next_account_number() {
     if [[ ! -f "$SEQUENCE_FILE" ]]; then
@@ -393,7 +613,7 @@ cmd_add_account() {
 # Remove account
 cmd_remove_account() {
     if [[ $# -eq 0 ]]; then
-        echo "Usage: $0 --remove-account <account_number|email>"
+        echo "Usage: $0 --remove-account <account_number|email|alias>"
         exit 1
     fi
     
@@ -405,20 +625,14 @@ cmd_remove_account() {
         exit 1
     fi
     
-    # Handle email vs numeric identifier
+    # Handle numeric identifier
     if [[ "$identifier" =~ ^[0-9]+$ ]]; then
         account_num="$identifier"
     else
-        # Validate email format
-        if ! validate_email "$identifier"; then
-            echo "Error: Invalid email format: $identifier"
-            exit 1
-        fi
-        
-        # Resolve email to account number
+        # Resolve email or alias to account number
         account_num=$(resolve_account_identifier "$identifier")
         if [[ -z "$account_num" ]]; then
-            echo "Error: No account found with email: $identifier"
+            echo "Error: No account found: $identifier"
             exit 1
         fi
     fi
@@ -431,8 +645,9 @@ cmd_remove_account() {
         exit 1
     fi
     
-    local email
+    local email account_alias
     email=$(echo "$account_info" | jq -r '.email')
+    account_alias=$(echo "$account_info" | jq -r '.alias // empty')
     
     local active_account
     active_account=$(jq -r '.activeAccountNumber' "$SEQUENCE_FILE")
@@ -447,6 +662,15 @@ cmd_remove_account() {
     if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
         echo "Cancelled"
         exit 0
+    fi
+    
+    # Remove alias shortcut if exists
+    if [[ -n "$account_alias" ]]; then
+        local shortcut_file="$ALIAS_DIR/$account_alias"
+        if [[ -f "$shortcut_file" ]]; then
+            rm -f "$shortcut_file"
+            echo "Removed shortcut: $account_alias"
+        fi
     fi
     
     # Remove backup files
@@ -519,10 +743,11 @@ cmd_list() {
     jq -r --arg active "$active_account_num" '
         .sequence[] as $num |
         .accounts["\($num)"] |
+        (if .alias then " [\(.alias)]" else "" end) as $alias_str |
         if "\($num)" == $active then
-            "  \($num): \(.email) (active)"
+            "  \($num): \(.email)\($alias_str) (active)"
         else
-            "  \($num): \(.email)"
+            "  \($num): \(.email)\($alias_str)"
         end
     ' "$SEQUENCE_FILE"
 }
@@ -692,25 +917,38 @@ show_usage() {
     echo "Usage: $0 [--force] [COMMAND]"
     echo ""
     echo "Global Flags:"
-    echo "  --force                          Skip Claude Code process check (for VSCode extension)"
+    echo "  --force                              Skip Claude Code process check (for VSCode extension)"
     echo ""
-    echo "Commands:"
-    echo "  --add-account                    Add current account to managed accounts"
-    echo "  --remove-account <num|email>    Remove account by number or email"
-    echo "  --list                           List all managed accounts"
-    echo "  --switch                         Rotate to next account in sequence"
-    echo "  --switch-to <num|email>          Switch to specific account number or email"
-    echo "  --help                           Show this help message"
+    echo "Account Commands:"
+    echo "  --add-account                        Add current account to managed accounts"
+    echo "  --remove-account <num|email|alias>   Remove account by number, email, or alias"
+    echo "  --list                               List all managed accounts"
+    echo "  --switch                             Rotate to next account in sequence"
+    echo "  --switch-to <num|email|alias>        Switch to specific account"
+    echo ""
+    echo "Alias Commands:"
+    echo "  --set-alias <num|email> <alias>      Set alias for an account"
+    echo "  --clear-alias <num|email|alias>      Remove alias from an account"
+    echo "  --create-shortcut <alias>            Create executable shortcut for alias"
+    echo "  --remove-shortcut <alias>            Remove shortcut"
+    echo ""
+    echo "Other:"
+    echo "  --help                               Show this help message"
     echo ""
     echo "Examples:"
     echo "  $0 --add-account"
     echo "  $0 --list"
     echo "  $0 --switch"
-    echo "  $0 --force --switch              (Skip process check, useful for VSCode)"
+    echo "  $0 --force --switch                  (Skip process check)"
     echo "  $0 --switch-to 2"
     echo "  $0 --switch-to user@example.com"
-    echo "  $0 --force --switch-to 2         (Skip process check)"
-    echo "  $0 --remove-account user@example.com"
+    echo "  $0 --set-alias 1 claude-pro"
+    echo "  $0 --switch-to claude-pro"
+    echo "  $0 --create-shortcut claude-pro      (Creates ~/...aliases/claude-pro)"
+    echo "  $0 --remove-account claude-pro"
+    echo ""
+    echo "Environment Variables:"
+    echo "  CCSWITCH_ALIAS_DIR                   Directory for alias shortcuts (default: ~/.claude-switch-backup/aliases)"
 }
 
 # Main script logic
@@ -755,6 +993,22 @@ main() {
         --switch-to)
             shift
             cmd_switch_to "$@"
+            ;;
+        --set-alias)
+            shift
+            cmd_set_alias "$@"
+            ;;
+        --clear-alias)
+            shift
+            cmd_clear_alias "$@"
+            ;;
+        --create-shortcut)
+            shift
+            cmd_create_shortcut "$@"
+            ;;
+        --remove-shortcut)
+            shift
+            cmd_remove_shortcut "$@"
             ;;
         --help)
             show_usage
